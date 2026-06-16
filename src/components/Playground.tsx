@@ -15,7 +15,14 @@ export default function Playground() {
   const [quality, setQuality] = useState(() => localStorage.getItem('Playground_quality') || 'auto');
   const [aspectRatio, setAspectRatio] = useState(() => localStorage.getItem('Playground_aspectRatio') || '16:9');
   const [resolution, setResolution] = useState(() => localStorage.getItem('Playground_resolution') || '2k');
-  const [refImagePreview, setRefImagePreview] = useState<string | null>(() => localStorage.getItem('Playground_refImagePreview') || null);
+  const [refImagePreviews, setRefImagePreviews] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('Playground_refImagePreviews');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
   
   const [logs, setLogs] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -39,23 +46,31 @@ export default function Playground() {
   useEffect(() => { localStorage.setItem('Playground_resolution', resolution); }, [resolution]);
   useEffect(() => { localStorage.setItem('Playground_history', JSON.stringify(history)); }, [history]);
 
-  const processFile = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const result = event.target?.result as string;
-      setRefImagePreview(result);
-      try {
-        localStorage.setItem('Playground_refImagePreview', result);
-      } catch (err) {
-        console.warn("Could not save image to localStorage, size might be too large");
-      }
-    };
-    reader.readAsDataURL(file);
+  const processFiles = (files: FileList | File[]) => {
+    const newFiles = Array.from(files);
+    
+    newFiles.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const result = event.target?.result as string;
+        setRefImagePreviews(prev => {
+          if (prev.length >= 16) return prev;
+          const newPreviews = [...prev, result];
+          try {
+            localStorage.setItem('Playground_refImagePreviews', JSON.stringify(newPreviews));
+          } catch (err) {
+            console.warn("Could not save image to localStorage, size might be too large");
+          }
+          return newPreviews;
+        });
+      };
+      reader.readAsDataURL(file);
+    });
   };
 
   const handleRefImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      processFile(e.target.files[0]);
+      processFiles(e.target.files);
     }
   };
 
@@ -73,9 +88,9 @@ export default function Playground() {
     e.preventDefault();
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('image/')) {
-        processFile(file);
+      const images = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
+      if (images.length > 0) {
+        processFiles(images);
       }
     }
   };
@@ -107,133 +122,184 @@ export default function Playground() {
       addLog(`Calculated Size: ${sizeStr}`);
       addLog(`Quality: ${quality}`);
       
-      let imageBlob: Blob;
-      let filename: string;
+      const [wStr, hStr] = sizeStr.split('x');
+      const targetW = parseInt(wStr, 10);
+      const targetH = parseInt(hStr, 10);
 
-      if (refImagePreview) {
-        addLog(`Using uploaded reference image...`);
-        try {
-          const fetchRes = await fetch(refImagePreview);
-          imageBlob = await fetchRes.blob();
-          filename = 'reference.png';
-        } catch (e) {
-          addLog(`Failed to load reference image blob, using blank canvas.`);
-          const canvas = document.createElement("canvas");
-          canvas.width = 1024;
-          canvas.height = 1024;
-          const ctx = canvas.getContext("2d");
-          if(ctx) {
-            ctx.fillStyle = "white";
-            ctx.fillRect(0, 0, 1024, 1024);
+      let imageBlobs: {blob: Blob, name: string}[] = [];
+
+      if (refImagePreviews.length > 0) {
+        addLog(`Using ${refImagePreviews.length} uploaded reference image(s)...`);
+        for (let i = 0; i < refImagePreviews.length; i++) {
+          try {
+            const fetchRes = await fetch(refImagePreviews[i]);
+            const blob = await fetchRes.blob();
+            imageBlobs.push({blob, name: `reference_${i}.png`});
+          } catch (e) {
+            addLog(`Failed to load reference image ${i}.`);
           }
-          const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'));
-          if (!blob) throw new Error("Failed to create blank image");
-          imageBlob = blob;
-          filename = 'image_0.png';
         }
-      } else {
-        addLog(`No reference image provided. Generating 1024x1024 blank canvas.`);
+      }
+
+      if (imageBlobs.length === 0) {
+        addLog(`No reference image provided. Generating ${targetW}x${targetH} blank canvas.`);
         const canvas = document.createElement("canvas");
-        canvas.width = 1024;
-        canvas.height = 1024;
+        canvas.width = targetW;
+        canvas.height = targetH;
         const ctx = canvas.getContext("2d");
         if(ctx) {
           ctx.fillStyle = "white";
-          ctx.fillRect(0, 0, 1024, 1024);
+          ctx.fillRect(0, 0, targetW, targetH);
         }
         
         const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'));
         if (!blob) throw new Error("Failed to create blank image");
-        imageBlob = blob;
-        filename = 'image_0.png';
+        imageBlobs.push({blob, name: 'image_0.png'});
       }
 
-      const formData = new FormData();
-      formData.append('prompt', prompt);
-      formData.append('model', model);
-      formData.append('n', '1');
-      formData.append('quality', quality);
-      formData.append('size', sizeStr);
-      formData.append('image', imageBlob, filename);
-      
-      addLog(`Sending POST /v1/images/edits?async=true...`);
-      
-      const res = await fetch('/api/t8star/v1/images/edits?async=true', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: formData
-      });
-      
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        addLog(`Failed to parse response: ${text.substring(0, 150)}`);
-        throw new Error("Invalid JSON response");
-      }
-      
-      addLog(`Response Status: ${res.status}`);
-      addLog(`Response: ${JSON.stringify(data).substring(0, 200)}...`);
-      
-      if (!res.ok) {
-        throw new Error(`API Error: ${data.message || data.error?.message || res.statusText}`);
-      }
-      
-      const taskId = data.task_id || data.data;
-      if (!taskId) {
-        throw new Error('No task ID returned');
-      }
-      
-      addLog(`Task submitted. ID: ${taskId}`);
-      
-      let attempts = 0;
-      while (attempts < 60) {
-        attempts++;
-        await new Promise(r => setTimeout(r, 5000));
-        addLog(`Polling status... (Attempt ${attempts})`);
-        
-        const statusRes = await fetch(`/api/t8star/v1/images/tasks/${taskId}`, {
-          headers: { 'Authorization': `Bearer ${apiKey}` }
-        });
-        
-        const statusText = await statusRes.text();
-        let statusData;
-        try {
-          statusData = JSON.parse(statusText);
-        } catch(e) {
-          addLog("Parsing error in status response");
-          continue;
+      if (model.includes('nano-banana')) {
+        const payload: any = {
+          model: model,
+          prompt: prompt,
+          response_format: 'url',
+          aspect_ratio: aspectRatio
+        };
+
+        if (refImagePreviews.length > 0) {
+          payload.image = refImagePreviews;
         }
 
-        const inner = statusData.data || {};
-        const state = inner.status;
-        addLog(`Status: ${state} | Progress: ${inner.progress || '0%'}`);
+        addLog(`Sending POST /v1/images/generations (JSON)...`);
         
-        if (state === 'SUCCESS') {
-          addLog("SUCCESS! Resolving Image...");
-          const resData = inner.data?.data?.[0];
-          if (resData && resData.url) {
-            setResultImg(resData.url);
-            addLog(`Final URL: ${resData.url}`);
-            
-            // Add to history
-            const newHistoryItem: GenerationHistory = {
-              id: taskId,
-              url: resData.url,
-              prompt: prompt,
-              timestamp: Date.now()
-            };
-            setHistory(prev => [newHistoryItem, ...prev].slice(0, 50)); // keep last 50
-          } else {
-             addLog(`Unexpected Data structure: ${JSON.stringify(inner.data).substring(0, 200)}`);
+        const res = await fetch('/api/t8star/v1/images/generations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(payload)
+        });
+        
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          throw new Error(`Invalid JSON response: ${text.substring(0, 100)}`);
+        }
+        
+        addLog(`Response Status: ${res.status}`);
+        addLog(`Response: ${JSON.stringify(data).substring(0, 200)}...`);
+        
+        if (!res.ok) {
+          throw new Error(`API Error: ${data.message || data.error?.message || res.statusText}`);
+        }
+        
+        if (data.data && data.data.length > 0 && data.data[0].url) {
+          const resUrl = data.data[0].url;
+          setResultImg(resUrl);
+          addLog(`Final URL: ${resUrl}`);
+          
+          const newHistoryItem: GenerationHistory = {
+            id: Date.now().toString(),
+            url: resUrl,
+            prompt: prompt,
+            timestamp: Date.now()
+          };
+          setHistory(prev => [newHistoryItem, ...prev].slice(0, 50));
+        } else {
+          throw new Error(`Unexpected Data structure: ${JSON.stringify(data)}`);
+        }
+      } else {
+        const formData = new FormData();
+        formData.append('prompt', prompt);
+        formData.append('model', model);
+        formData.append('n', '1');
+        formData.append('quality', quality);
+        formData.append('size', sizeStr);
+        imageBlobs.forEach(item => {
+          formData.append('image', item.blob, item.name);
+        });
+        
+        addLog(`Sending POST /v1/images/edits?async=true...`);
+        
+        const res = await fetch('/api/t8star/v1/images/edits?async=true', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: formData
+        });
+        
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          addLog(`Failed to parse response: ${text.substring(0, 150)}`);
+          throw new Error("Invalid JSON response");
+        }
+        
+        addLog(`Response Status: ${res.status}`);
+        addLog(`Response: ${JSON.stringify(data).substring(0, 200)}...`);
+        
+        if (!res.ok) {
+          throw new Error(`API Error: ${data.message || data.error?.message || res.statusText}`);
+        }
+        
+        const taskId = data.task_id || data.data;
+        if (!taskId) {
+          throw new Error('No task ID returned');
+        }
+        
+        addLog(`Task submitted. ID: ${taskId}`);
+        
+        let attempts = 0;
+        while (attempts < 60) {
+          attempts++;
+          await new Promise(r => setTimeout(r, 5000));
+          addLog(`Polling status... (Attempt ${attempts})`);
+          
+          const statusRes = await fetch(`/api/t8star/v1/images/tasks/${taskId}`, {
+            headers: { 'Authorization': `Bearer ${apiKey}` }
+          });
+          
+          const statusText = await statusRes.text();
+          let statusData;
+          try {
+            statusData = JSON.parse(statusText);
+          } catch(e) {
+            addLog("Parsing error in status response");
+            continue;
           }
-          break;
-        } else if (state === 'FAILURE') {
-          addLog(`Task failed: ${inner.fail_reason}`);
-          break;
+
+          const inner = statusData.data || {};
+          const state = inner.status;
+          addLog(`Status: ${state} | Progress: ${inner.progress || '0%'}`);
+          
+          if (state === 'SUCCESS') {
+            addLog("SUCCESS! Resolving Image...");
+            const resData = inner.data?.data?.[0];
+            if (resData && resData.url) {
+              setResultImg(resData.url);
+              addLog(`Final URL: ${resData.url}`);
+              
+              // Add to history
+              const newHistoryItem: GenerationHistory = {
+                id: taskId,
+                url: resData.url,
+                prompt: prompt,
+                timestamp: Date.now()
+              };
+              setHistory(prev => [newHistoryItem, ...prev].slice(0, 50)); // keep last 50
+            } else {
+               addLog(`Unexpected Data structure: ${JSON.stringify(inner.data).substring(0, 200)}`);
+            }
+            break;
+          } else if (state === 'FAILURE') {
+            addLog(`Task failed: ${inner.fail_reason}`);
+            break;
+          }
         }
       }
 
@@ -298,24 +364,51 @@ export default function Playground() {
           </div>
 
           <div className="space-y-1.5">
-            <span className="text-[10px] font-mono text-zinc-500 uppercase">Reference Image (Optional)</span>
-            {refImagePreview ? (
-              <div className="relative inline-block mt-2">
-                <img 
-                  src={refImagePreview} 
-                  alt="Reference Preview" 
-                  className="w-24 h-24 object-cover rounded-lg border border-zinc-800 cursor-pointer" 
-                  onClick={() => setZoomedImage(refImagePreview)}
-                />
-                <button
-                  onClick={() => {
-                    setRefImagePreview(null);
-                    localStorage.removeItem('Playground_refImagePreview');
-                  }}
-                  className="absolute -top-2 -right-2 bg-red-600 text-white rounded-full p-1 w-5 h-5 flex items-center justify-center text-[10px] shadow-lg hover:bg-red-500"
-                >
-                  <X className="w-3 h-3" />
-                </button>
+            <span className="text-[10px] font-mono text-zinc-500 uppercase">Reference Images (Optional, up to 16)</span>
+            {refImagePreviews.length > 0 ? (
+              <div className="flex flex-wrap gap-3 mt-2">
+                {refImagePreviews.map((preview, idx) => (
+                  <div key={idx} className="relative inline-block">
+                    <img 
+                      src={preview} 
+                      alt={`Reference ${idx + 1}`} 
+                      className="w-20 h-20 object-cover rounded-lg border border-zinc-800 cursor-pointer" 
+                      onClick={() => setZoomedImage(preview)}
+                    />
+                    <button
+                      onClick={() => {
+                        setRefImagePreviews(prev => {
+                          const newPreviews = prev.filter((_, i) => i !== idx);
+                          if (newPreviews.length > 0) {
+                            localStorage.setItem('Playground_refImagePreviews', JSON.stringify(newPreviews));
+                          } else {
+                            localStorage.removeItem('Playground_refImagePreviews');
+                          }
+                          return newPreviews;
+                        });
+                      }}
+                      className="absolute -top-2 -right-2 bg-red-600 text-white rounded-full p-1 w-5 h-5 flex items-center justify-center text-[10px] shadow-lg hover:bg-red-500 z-10"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+                {refImagePreviews.length < 16 && (
+                  <div 
+                    className={`flex items-center justify-center w-20 h-20 border-2 border-dashed rounded-lg transition-colors cursor-pointer relative overflow-hidden ${
+                      isDragging ? 'border-violet-500 bg-violet-500/10' : 'border-zinc-800 hover:border-violet-500/50'
+                    }`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                  >
+                    <div className="flex flex-col items-center justify-center text-zinc-500 pointer-events-none">
+                      <ImageIcon className={`w-5 h-5 mb-1 ${isDragging ? 'text-violet-400' : ''}`} />
+                      <span className="text-[10px] font-mono text-center leading-tight">{isDragging ? 'Drop' : 'Add'}</span>
+                    </div>
+                    <input type="file" multiple accept="image/*" onChange={handleRefImageChange} className="absolute inset-0 opacity-0 cursor-pointer" />
+                  </div>
+                )}
               </div>
             ) : (
               <div 
@@ -328,9 +421,9 @@ export default function Playground() {
               >
                 <div className="flex flex-col items-center justify-center text-zinc-500 pointer-events-none">
                   <ImageIcon className={`w-6 h-6 mb-2 ${isDragging ? 'text-violet-400' : ''}`} />
-                  <span className="text-xs font-mono">{isDragging ? 'Drop here' : 'Click or Drag Image'}</span>
+                  <span className="text-xs font-mono">{isDragging ? 'Drop here' : 'Click or Drag Images (Up to 16)'}</span>
                 </div>
-                <input type="file" accept="image/*" onChange={handleRefImageChange} className="absolute inset-0 opacity-0 cursor-pointer" />
+                <input type="file" multiple accept="image/*" onChange={handleRefImageChange} className="absolute inset-0 opacity-0 cursor-pointer" />
               </div>
             )}
           </div>
@@ -341,6 +434,7 @@ export default function Playground() {
               <select value={model} onChange={(e) => setModel(e.target.value)} className="w-full bg-zinc-950 border border-zinc-800 p-2.5 rounded-lg text-xs font-mono">
                 <option value="gpt-image-2">gpt-image-2</option>
                 <option value="gpt-image-2-all">gpt-image-2-all</option>
+                <option value="nano-banana-pro-2k">nano-banana-pro-2k</option>
               </select>
             </div>
             <div className="space-y-1.5">
